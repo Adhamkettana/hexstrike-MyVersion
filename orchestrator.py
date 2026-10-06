@@ -618,7 +618,7 @@ class Orchestrator:
     """
 
     def __init__(self, scope: Scope, vuln_types: list[VulnType],
-                 max_workers: int = 5, max_restarts: int = 2):
+                 max_workers: int = 3, max_restarts: int = 2):
         self.scope = scope
         self.vuln_types = vuln_types
         self.max_workers = max_workers
@@ -637,6 +637,7 @@ class Orchestrator:
         self.agents: dict[str, dict] = {}  # agent_id -> metadata
         self.processes: dict[str, Process] = {}
         self.restart_counts: dict[str, int] = {}  # vuln_type -> restart count
+        self.pending_vuln_types: list[VulnType] = list(self.vuln_types)
 
         self.logger = _setup_logging("orchestrator", RESULTS_DIR / "logs")
         self.start_time = None
@@ -744,8 +745,20 @@ class Orchestrator:
             elif msg_type == MessageType.AGENT_COMPLETE:
                 self.logger.info(f"Agent {sender} completed.")
 
+    def _active_count(self) -> int:
+        """Count how many agent processes are currently alive."""
+        return sum(1 for p in self.processes.values() if p.is_alive())
+
+    def _spawn_next_agents(self):
+        """Spawn queued agents up to the max_workers limit."""
+        while self.pending_vuln_types and self._active_count() < self.max_workers:
+            if self.shutdown_event.is_set():
+                break
+            vt = self.pending_vuln_types.pop(0)
+            self._spawn_agent(vt)
+
     def _check_health(self):
-        """Check for dead processes and restart them if under limit."""
+        """Check for dead processes, handle restarts, and fill available worker slots."""
         for agent_id, proc in list(self.processes.items()):
             if not proc.is_alive():
                 info = self.agents.get(agent_id, {})
@@ -760,28 +773,32 @@ class Orchestrator:
                     if restarts < self.max_restarts:
                         self.logger.warning(
                             f"Agent {agent_id} died (exit={proc.exitcode}). "
-                            f"Restarting ({restarts + 1}/{self.max_restarts})..."
+                            f"Queuing restart ({restarts + 1}/{self.max_restarts})..."
                         )
                         self.restart_counts[vuln_type.value] = restarts + 1
-                        self._spawn_agent(vuln_type)
+                        self.pending_vuln_types.append(vuln_type)
                     else:
                         self.logger.error(
                             f"Agent {agent_id} exceeded max restarts. Giving up."
                         )
 
+        # Spawn queued agents if slots are available
+        self._spawn_next_agents()
+
     def _all_done(self) -> bool:
-        """Check if all agent processes have finished."""
-        return all(not p.is_alive() for p in self.processes.values())
+        """Check if all queued and active agent processes have finished."""
+        return len(self.pending_vuln_types) == 0 and all(not p.is_alive() for p in self.processes.values())
 
     def _print_status(self):
         """Print a live status dashboard to terminal."""
-        elapsed = time.monotonic() - self.start_time
+        elapsed = time.monotonic() - self.start_time if self.start_time else 0.0
+        active_count = self._active_count()
         lines = [
             "",
             f"{'═' * 70}",
             f"  HUNTERV2 ORCHESTRATOR — {self.scope.target}",
-            f"  Elapsed: {elapsed:.0f}s | Agents: {len(self.processes)} | "
-            f"Findings: {len(self.findings)}",
+            f"  Elapsed: {elapsed:.0f}s | Active: {active_count}/{self.max_workers} | "
+            f"Queued: {len(self.pending_vuln_types)} | Findings: {len(self.findings)}",
             f"{'─' * 70}",
         ]
         for agent_id, info in self.agents.items():
@@ -906,10 +923,12 @@ class Orchestrator:
         signal.signal(signal.SIGINT, _graceful_shutdown)
 
         try:
-            # Phase 1: Spawn agents
-            self.logger.info(f"Spawning {len(self.vuln_types)} agents...")
-            for vt in self.vuln_types:
-                self._spawn_agent(vt)
+            # Phase 1: Spawn initial batch of agents (up to max_workers)
+            self.logger.info(
+                f"Starting hunt with {len(self.vuln_types)} agent types configured "
+                f"(max {self.max_workers} running concurrently)..."
+            )
+            self._spawn_next_agents()
 
             # Phase 2: Monitor loop
             status_interval = 3.0  # print status every N seconds
@@ -920,6 +939,9 @@ class Orchestrator:
             while not self._all_done() and not self.shutdown_event.is_set():
                 # Process messages from agents
                 self._process_messages(timeout=0.5)
+
+                # Replenish agent slots if any finished or died
+                self._spawn_next_agents()
 
                 now = time.monotonic()
 
@@ -998,7 +1020,10 @@ Examples:
         choices=[v.value for v in VulnType],
         help="Which vulnerability classes to hunt for",
     )
-    parser.add_argument("--workers", type=int, default=5)
+    parser.add_argument(
+        "--workers", type=int, default=3,
+        help="Max agents that run at the same time (concurrency limit)",
+    )
     parser.add_argument("--max-depth", type=int, default=7)
     parser.add_argument(
         "--rate-limit", type=float, default=10.0,
